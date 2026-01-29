@@ -44,6 +44,33 @@ class CostEntry(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+class InMemoryLedger:
+    """Ledger that stores CostEntry list and supports per-run aggregation."""
+
+    def __init__(self) -> None:
+        self.entries: list[CostEntry] = []
+
+    def record(self, entry: CostEntry) -> None:
+        """Record a cost entry."""
+        self.entries.append(entry)
+
+    def total_dollars(self, run_id: str | None = None) -> float:
+        """Sum dollars for all entries, optionally filtered by run_id."""
+        if run_id is None:
+            return round(sum(e.dollars for e in self.entries), 6)
+        return round(sum(e.dollars for e in self.entries if e.run_id == run_id), 6)
+
+    def summary(self, run_id: str | None = None) -> dict[str, Any]:
+        """Aggregate by node and by provider. Optional run_id filter."""
+        subset = self.entries if run_id is None else [e for e in self.entries if e.run_id == run_id]
+        by_node: dict[str, float] = {}
+        by_provider: dict[str, float] = {}
+        for e in subset:
+            by_node[e.node.value] = by_node.get(e.node.value, 0.0) + e.dollars
+            by_provider[e.provider] = by_provider.get(e.provider, 0.0) + e.dollars
+        return {"by_node": by_node, "by_provider": by_provider}
+
+
 class JsonLogLedger:
     """Ledger implementation that writes one JSON line to logger metismedia.cost."""
 
