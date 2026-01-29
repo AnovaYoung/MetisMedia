@@ -1,6 +1,7 @@
 """Redis Streams consumer worker with retry and DLQ support."""
 
 import asyncio
+import inspect
 import json
 import logging
 import random
@@ -13,6 +14,8 @@ from redis.asyncio import Redis
 from redis.exceptions import ResponseError
 
 from metismedia.contracts.enums import NodeName
+from metismedia.core.budget import Budget
+from metismedia.core.ledger import CostLedger
 from metismedia.events.bus import EventBus
 from metismedia.events.constants import GROUP_NAME, MAX_RETRIES, STREAM_MAIN
 from metismedia.events.envelope import EventEnvelope
@@ -21,11 +24,64 @@ from metismedia.events.idempotency import already_processed, mark_processed
 logger = logging.getLogger(__name__)
 
 # Handler type: async function taking EventEnvelope, returning None
-Handler = Callable[[EventEnvelope], Awaitable[None]]
+# Extended handlers may also accept budget and ledger kwargs
+Handler = Callable[..., Awaitable[None]]
 
 # Backoff configuration
 BACKOFF_BASE_SECONDS = 0.5
 BACKOFF_JITTER_MAX = 0.2
+
+
+def _handler_accepts_kwarg(handler: Handler, kwarg: str) -> bool:
+    """Check if handler accepts a given keyword argument.
+
+    Args:
+        handler: Handler function or callable
+        kwarg: Keyword argument name to check
+
+    Returns:
+        True if handler accepts the kwarg (explicit param or **kwargs)
+    """
+    try:
+        sig = inspect.signature(handler)
+        params = sig.parameters
+
+        if kwarg in params:
+            return True
+
+        for param in params.values():
+            if param.kind == inspect.Parameter.VAR_KEYWORD:
+                return True
+
+        return False
+    except (ValueError, TypeError):
+        return False
+
+
+async def _invoke_handler(
+    handler: Handler,
+    envelope: EventEnvelope,
+    ledger: CostLedger | None = None,
+) -> None:
+    """Invoke handler with envelope, passing optional kwargs if supported.
+
+    Backward compatible: if handler only accepts envelope, call with just envelope.
+    If handler accepts ledger kwarg, pass it.
+
+    Args:
+        handler: Handler function or callable
+        envelope: Event envelope to pass
+        ledger: Optional cost ledger
+    """
+    kwargs: dict[str, Any] = {}
+
+    if ledger is not None and _handler_accepts_kwarg(handler, "ledger"):
+        kwargs["ledger"] = ledger
+
+    if kwargs:
+        await handler(envelope, **kwargs)
+    else:
+        await handler(envelope)
 
 
 def calculate_backoff(attempt: int) -> float:
@@ -136,6 +192,8 @@ class Worker:
         stream: str = STREAM_MAIN,
         block_ms: int = 1000,
         count: int = 10,
+        budget: Budget | None = None,
+        ledger: CostLedger | None = None,
     ) -> int:
         """Run worker loop, processing messages from stream.
 
@@ -145,6 +203,9 @@ class Worker:
             stream: Stream to consume from
             block_ms: XREADGROUP block timeout in ms
             count: Max messages per read
+            budget: Optional budget limits. Worker passes budget/ledger to handlers;
+                budget enforcement occurs at the node/runtime layer (Module 6).
+            ledger: Optional cost ledger; passed to handlers for recording costs.
 
         Returns:
             Number of messages processed
@@ -174,7 +235,8 @@ class Worker:
                     try:
                         envelope = decode_envelope(message_data)
                         await self._process_message(
-                            message_id, envelope, handler_registry, stream
+                            message_id, envelope, handler_registry, stream,
+                            budget=budget, ledger=ledger,
                         )
                         processed_count += 1
                     except Exception as e:
@@ -189,6 +251,8 @@ class Worker:
         envelope: EventEnvelope,
         handler_registry: dict[str, Handler],
         stream: str,
+        budget: Budget | None = None,
+        ledger: CostLedger | None = None,
     ) -> None:
         """Process a single message.
 
@@ -197,7 +261,11 @@ class Worker:
             envelope: Decoded event envelope
             handler_registry: Handler functions by event name
             stream: Stream name for acking
+            budget: Optional budget limits (enforcement at node/runtime layer, Module 6).
+            ledger: Optional cost ledger; passed through to handler invocation.
         """
+        _ = budget  # Deferred to Module 6
+
         if await already_processed(self.redis, envelope):
             logger.debug(f"Skipping already processed event: {envelope.idempotency_key}")
             await self.redis.xack(stream, self.group_name, message_id)
@@ -210,7 +278,7 @@ class Worker:
             return
 
         try:
-            await handler(envelope)
+            await _invoke_handler(handler, envelope, ledger=ledger)
             await mark_processed(self.redis, envelope)
             await self.redis.xack(stream, self.group_name, message_id)
             logger.debug(f"Successfully processed event: {envelope.event_id}")
