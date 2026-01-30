@@ -8,7 +8,7 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from metismedia.contracts.enums import NodeName
-from metismedia.core.budget import Budget
+from metismedia.core.budget import Budget, BudgetState, budget_guard
 from metismedia.core.ledger import CostEntry, CostLedger, compute_cost
 from metismedia.db.queries.node_b import reserve_top_influencers_for_review
 from metismedia.db.repos import (
@@ -20,6 +20,7 @@ from metismedia.db.repos import (
 from metismedia.db.repos.receipt import ReceiptRepo
 from metismedia.events.bus import EventBus
 from metismedia.events.envelope import EventEnvelope
+from metismedia.events.idemkeys import make_idempotency_key
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +34,9 @@ def _record_cost(
     unit_cost: float,
     quantity: float,
     metadata: dict[str, Any] | None = None,
+    budget: Budget | None = None,
+    budget_state: BudgetState | None = None,
 ) -> None:
-    if ledger is None:
-        return
     dollars = compute_cost(unit_cost, quantity)
     entry = CostEntry(
         tenant_id=envelope.tenant_id,
@@ -49,7 +50,21 @@ def _record_cost(
         dollars=dollars,
         metadata=metadata or {},
     )
-    ledger.record(entry)
+    if ledger is not None:
+        ledger.record(entry)
+    if budget is not None and budget_state is not None:
+        budget_guard(
+            budget,
+            budget_state,
+            cost_delta=entry.dollars,
+            provider=entry.provider,
+            calls_delta=1,
+            node=entry.node.value,
+        )
+        budget_state.dollars_spent += entry.dollars
+        budget_state.provider_calls[entry.provider] = (
+            budget_state.provider_calls.get(entry.provider, 0) + 1
+        )
 
 
 async def _mark_run_completed_no_targets(
@@ -81,9 +96,13 @@ async def handle_node_a_brief_finalized(
     budget: Budget,
     ledger: CostLedger | None,
     bus: EventBus,
+    budget_state: BudgetState | None = None,
 ) -> None:
     """Node A: record cost, publish node_b.input with query_embedding_id or mark completed."""
-    _record_cost(envelope, ledger, NodeName.A, "internal", "brief_validate", 0.0, 1.0)
+    _record_cost(
+        envelope, ledger, NodeName.A, "internal", "brief_validate", 0.0, 1.0,
+        budget=budget, budget_state=budget_state,
+    )
     logger.info(f"Node A: Brief finalized for campaign {envelope.payload.get('campaign_id')}")
 
     brief = envelope.payload.get("brief") or {}
@@ -104,7 +123,13 @@ async def handle_node_a_brief_finalized(
         event_name="node_b.input",
         trace_id=envelope.trace_id,
         run_id=envelope.run_id,
-        idempotency_key=f"{envelope.run_id}:b:init",
+        idempotency_key=make_idempotency_key(
+            tenant_id=envelope.tenant_id,
+            run_id=envelope.run_id,
+            node=NodeName.B,
+            event_name="node_b.input",
+            step="reserve",
+        ),
         payload={
             "campaign_id": campaign_id,
             "query_embedding_id": query_embedding_id,
@@ -120,6 +145,7 @@ async def handle_node_b_input(
     budget: Budget,
     ledger: CostLedger | None,
     bus: EventBus,
+    budget_state: BudgetState | None = None,
 ) -> None:
     """Node B: reserve top influencers, record cost, publish node_b.directive_emitted per reserved."""
     tenant_id = envelope.tenant_id
@@ -140,7 +166,8 @@ async def handle_node_b_input(
     )
 
     _record_cost(
-        envelope, ledger, NodeName.B, "postgres", "vector_search", 0.001, float(len(reserved))
+        envelope, ledger, NodeName.B, "postgres", "vector_search", 0.001, float(len(reserved)),
+        budget=budget, budget_state=budget_state,
     )
 
     if not reserved:
@@ -157,7 +184,13 @@ async def handle_node_b_input(
             event_name="node_b.directive_emitted",
             trace_id=envelope.trace_id,
             run_id=envelope.run_id,
-            idempotency_key=f"{envelope.run_id}:b:{r.influencer_id}",
+            idempotency_key=make_idempotency_key(
+                tenant_id=tenant_id,
+                run_id=envelope.run_id,
+                node=NodeName.B,
+                event_name="node_b.directive_emitted",
+                step=f"reserve:{r.influencer_id}",
+            ),
             payload={
                 "campaign_id": str(campaign_id),
                 "influencer_id": str(r.influencer_id),
@@ -177,6 +210,7 @@ async def handle_node_b_directive_emitted(
     budget: Budget,
     ledger: CostLedger | None,
     bus: EventBus,
+    budget_state: BudgetState | None = None,
 ) -> None:
     """Forward: publish node_c.input for this influencer."""
     campaign_id = envelope.payload.get("campaign_id")
@@ -189,7 +223,13 @@ async def handle_node_b_directive_emitted(
         event_name="node_c.input",
         trace_id=envelope.trace_id,
         run_id=envelope.run_id,
-        idempotency_key=f"{envelope.run_id}:c:{influencer_id}",
+        idempotency_key=make_idempotency_key(
+            tenant_id=envelope.tenant_id,
+            run_id=envelope.run_id,
+            node=NodeName.C,
+            event_name="node_c.input",
+            step=f"discover:{influencer_id}",
+        ),
         payload={"campaign_id": campaign_id, "influencer_id": influencer_id},
     )
     await bus.publish(next_envelope)
@@ -201,6 +241,7 @@ async def handle_node_c_input(
     budget: Budget,
     ledger: CostLedger | None,
     bus: EventBus,
+    budget_state: BudgetState | None = None,
 ) -> None:
     """Node C: mock discovery, insert receipt, record cost, publish node_d.input."""
     tenant_id = envelope.tenant_id
@@ -230,6 +271,7 @@ async def handle_node_c_input(
     _record_cost(
         envelope, ledger, NodeName.C, "mock_discovery", "scrape", 0.02, 1.0,
         metadata={"influencer_id": influencer_id},
+        budget=budget, budget_state=budget_state,
     )
 
     next_envelope = EventEnvelope(
@@ -238,7 +280,13 @@ async def handle_node_c_input(
         event_name="node_d.input",
         trace_id=envelope.trace_id,
         run_id=envelope.run_id,
-        idempotency_key=f"{envelope.run_id}:d:{influencer_id}",
+        idempotency_key=make_idempotency_key(
+            tenant_id=tenant_id,
+            run_id=envelope.run_id,
+            node=NodeName.D,
+            event_name="node_d.input",
+            step=f"profile:{influencer_id}",
+        ),
         payload={"campaign_id": campaign_id, "influencer_id": influencer_id, "receipt_id": str(receipt_id)},
     )
     await bus.publish(next_envelope)
@@ -251,6 +299,7 @@ async def handle_node_d_input(
     budget: Budget,
     ledger: CostLedger | None,
     bus: EventBus,
+    budget_state: BudgetState | None = None,
 ) -> None:
     """Node D: mock profile, insert target card, record cost, publish node_e.input."""
     tenant_id = envelope.tenant_id
@@ -274,7 +323,10 @@ async def handle_node_d_input(
         },
     )
 
-    _record_cost(envelope, ledger, NodeName.D, "mock_llm", "profile", 0.01, 1.0)
+    _record_cost(
+        envelope, ledger, NodeName.D, "mock_llm", "profile", 0.01, 1.0,
+        budget=budget, budget_state=budget_state,
+    )
 
     next_envelope = EventEnvelope(
         tenant_id=tenant_id,
@@ -282,7 +334,13 @@ async def handle_node_d_input(
         event_name="node_e.input",
         trace_id=envelope.trace_id,
         run_id=envelope.run_id,
-        idempotency_key=f"{envelope.run_id}:e:{influencer_id}",
+        idempotency_key=make_idempotency_key(
+            tenant_id=tenant_id,
+            run_id=envelope.run_id,
+            node=NodeName.E,
+            event_name="node_e.input",
+            step=f"contact:{influencer_id}",
+        ),
         payload={"campaign_id": campaign_id, "influencer_id": influencer_id, "target_card_id": str(card_id)},
     )
     await bus.publish(next_envelope)
@@ -295,6 +353,7 @@ async def handle_node_e_input(
     budget: Budget,
     ledger: CostLedger | None,
     bus: EventBus,
+    budget_state: BudgetState | None = None,
 ) -> None:
     """Node E: mock contact lookup, insert contact, record cost, publish node_f.input."""
     tenant_id = envelope.tenant_id
@@ -319,7 +378,10 @@ async def handle_node_e_input(
         },
     )
 
-    _record_cost(envelope, ledger, NodeName.E, "mock_contact", "lookup", 0.005, 1.0)
+    _record_cost(
+        envelope, ledger, NodeName.E, "mock_contact", "lookup", 0.005, 1.0,
+        budget=budget, budget_state=budget_state,
+    )
 
     next_envelope = EventEnvelope(
         tenant_id=tenant_id,
@@ -327,7 +389,13 @@ async def handle_node_e_input(
         event_name="node_f.input",
         trace_id=envelope.trace_id,
         run_id=envelope.run_id,
-        idempotency_key=f"{envelope.run_id}:f:{influencer_id}",
+        idempotency_key=make_idempotency_key(
+            tenant_id=tenant_id,
+            run_id=envelope.run_id,
+            node=NodeName.F,
+            event_name="node_f.input",
+            step=f"draft:{influencer_id}",
+        ),
         payload={"campaign_id": campaign_id, "influencer_id": influencer_id, "contact_id": str(contact_id)},
     )
     await bus.publish(next_envelope)
@@ -340,6 +408,7 @@ async def handle_node_f_input(
     budget: Budget,
     ledger: CostLedger | None,
     bus: EventBus,
+    budget_state: BudgetState | None = None,
 ) -> None:
     """Node F: mock draft writer, insert draft, record cost, publish node_g.input."""
     tenant_id = envelope.tenant_id
@@ -361,7 +430,10 @@ async def handle_node_f_input(
         status="draft",
     )
 
-    _record_cost(envelope, ledger, NodeName.F, "mock_llm", "draft_generate", 0.015, 1.0)
+    _record_cost(
+        envelope, ledger, NodeName.F, "mock_llm", "draft_generate", 0.015, 1.0,
+        budget=budget, budget_state=budget_state,
+    )
 
     next_envelope = EventEnvelope(
         tenant_id=tenant_id,
@@ -369,7 +441,13 @@ async def handle_node_f_input(
         event_name="node_g.input",
         trace_id=envelope.trace_id,
         run_id=envelope.run_id,
-        idempotency_key=f"{envelope.run_id}:g:{influencer_id}",
+        idempotency_key=make_idempotency_key(
+            tenant_id=tenant_id,
+            run_id=envelope.run_id,
+            node=NodeName.G,
+            event_name="node_g.input",
+            step=f"finalize:{influencer_id}",
+        ),
         payload={"campaign_id": campaign_id, "influencer_id": influencer_id, "draft_id": str(draft_id)},
     )
     await bus.publish(next_envelope)
@@ -382,9 +460,13 @@ async def handle_node_g_input(
     budget: Budget,
     ledger: CostLedger | None,
     bus: EventBus,
+    budget_state: BudgetState | None = None,
 ) -> None:
     """Node G: record cost, count target_cards/drafts, update run status completed."""
-    _record_cost(envelope, ledger, NodeName.G, "internal", "finalize", 0.0, 1.0)
+    _record_cost(
+        envelope, ledger, NodeName.G, "internal", "finalize", 0.0, 1.0,
+        budget=budget, budget_state=budget_state,
+    )
     logger.info("Node G: Finalizing run")
 
     campaign_id_str = envelope.payload.get("campaign_id")

@@ -14,8 +14,10 @@ from redis.asyncio import Redis
 from redis.exceptions import ResponseError
 
 from metismedia.contracts.enums import NodeName
-from metismedia.core.budget import Budget
+from metismedia.core.budget import Budget, BudgetExceeded, BudgetState
 from metismedia.core.ledger import CostLedger
+from metismedia.db.repos import RunRepo
+from metismedia.db.session import db_session
 from metismedia.events.bus import EventBus
 from metismedia.events.constants import GROUP_NAME, MAX_RETRIES, STREAM_MAIN
 from metismedia.events.envelope import EventEnvelope
@@ -62,21 +64,25 @@ async def _invoke_handler(
     handler: Handler,
     envelope: EventEnvelope,
     ledger: CostLedger | None = None,
+    budget_state: BudgetState | None = None,
 ) -> None:
     """Invoke handler with envelope, passing optional kwargs if supported.
 
     Backward compatible: if handler only accepts envelope, call with just envelope.
-    If handler accepts ledger kwarg, pass it.
+    If handler accepts ledger or budget_state kwarg, pass them.
 
     Args:
         handler: Handler function or callable
         envelope: Event envelope to pass
         ledger: Optional cost ledger
+        budget_state: Optional per-run budget state for enforcement
     """
     kwargs: dict[str, Any] = {}
 
     if ledger is not None and _handler_accepts_kwarg(handler, "ledger"):
         kwargs["ledger"] = ledger
+    if budget_state is not None and _handler_accepts_kwarg(handler, "budget_state"):
+        kwargs["budget_state"] = budget_state
 
     if kwargs:
         await handler(envelope, **kwargs)
@@ -163,6 +169,7 @@ class Worker:
         self.group_name = group_name
         self.consumer_name = consumer_name
         self._stop_requested = False
+        self._budget_states: dict[str, BudgetState] = {}
 
     async def ensure_group(self, stream: str = STREAM_MAIN) -> None:
         """Ensure consumer group exists, creating if necessary.
@@ -264,8 +271,6 @@ class Worker:
             budget: Optional budget limits (enforcement at node/runtime layer, Module 6).
             ledger: Optional cost ledger; passed through to handler invocation.
         """
-        _ = budget  # Deferred to Module 6
-
         if await already_processed(self.redis, envelope):
             logger.debug(f"Skipping already processed event: {envelope.idempotency_key}")
             await self.redis.xack(stream, self.group_name, message_id)
@@ -277,11 +282,33 @@ class Worker:
             await self.redis.xack(stream, self.group_name, message_id)
             return
 
+        budget_state: BudgetState | None = None
+        if budget is not None:
+            key = f"{envelope.tenant_id}:{envelope.run_id}"
+            if key not in self._budget_states:
+                self._budget_states[key] = BudgetState()
+            budget_state = self._budget_states[key]
+
         try:
-            await _invoke_handler(handler, envelope, ledger=ledger)
+            await _invoke_handler(
+                handler, envelope, ledger=ledger, budget_state=budget_state
+            )
             await mark_processed(self.redis, envelope)
             await self.redis.xack(stream, self.group_name, message_id)
             logger.debug(f"Successfully processed event: {envelope.event_id}")
+
+        except BudgetExceeded as e:
+            logger.warning(f"Budget exceeded for run {envelope.run_id}: {e}")
+            async with db_session() as session:
+                run_repo = RunRepo(session)
+                await run_repo.update_status(
+                    tenant_id=envelope.tenant_id,
+                    run_id=UUID(envelope.run_id),
+                    status="failed",
+                    error_message=f"Budget exceeded: {e}",
+                )
+                await session.commit()
+            await self.redis.xack(stream, self.group_name, message_id)
 
         except Exception as e:
             error_msg = str(e)

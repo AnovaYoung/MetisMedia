@@ -41,6 +41,9 @@ class Settings(BaseSettings):
     # API
     api_v1_prefix: str = "/api/v1"
 
+    # Node A briefing
+    node_a_hardblocker_min_confidence: float = 0.7
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

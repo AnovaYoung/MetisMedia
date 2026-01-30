@@ -13,6 +13,7 @@ from metismedia.db.repos import CampaignRepo, RunRepo
 from metismedia.db.session import db_session
 from metismedia.events.bus import EventBus
 from metismedia.events.envelope import EventEnvelope
+from metismedia.events.idemkeys import make_idempotency_key
 from metismedia.orchestration.run_models import DossierResult
 
 logger = logging.getLogger(__name__)
@@ -60,7 +61,13 @@ class Orchestrator:
                 event_name="node_a.brief_finalized",
                 trace_id=trace_id,
                 run_id=str(run_id),
-                idempotency_key=f"{run_id}:a:init",
+                idempotency_key=make_idempotency_key(
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    node=NodeName.A,
+                    event_name="node_a.brief_finalized",
+                    step="brief_finalized",
+                ),
                 payload={
                     "campaign_id": str(campaign_id),
                     "brief": brief.model_dump(mode="json"),

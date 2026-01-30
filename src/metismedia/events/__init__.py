@@ -9,6 +9,7 @@ from metismedia.events.constants import (
     STREAM_MAIN,
 )
 from metismedia.events.envelope import EventEnvelope
+from metismedia.events.idemkeys import make_idempotency_key
 from metismedia.events.idempotency import (
     already_processed,
     build_idem_key,
@@ -26,6 +27,7 @@ __all__ = [
     "MAX_RETRIES",
     "IDEM_TTL_SECONDS",
     "build_idem_key",
+    "make_idempotency_key",
     "already_processed",
     "mark_processed",
 ]

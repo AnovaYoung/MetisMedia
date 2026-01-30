@@ -1,22 +1,24 @@
 """End-to-end tests for the event-driven orchestrator demo run."""
 
 import asyncio
+import json
 import logging
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
-from metismedia.contracts.enums import CommercialMode, PolarityIntent
+from metismedia.contracts.enums import CommercialMode, NodeName, PolarityIntent
 from metismedia.contracts.models import CampaignBrief
 from metismedia.core import Budget, CostEntry, CostLedger, InMemoryLedger, JsonLogLedger
 from metismedia.db.repos import (
     DraftRepo,
     EmbeddingRepo,
     InfluencerRepo,
+    RunRepo,
     TargetCardRepo,
 )
 from metismedia.db.session import db_session
-from metismedia.events import EventBus, Worker
+from metismedia.events import EventBus, EventEnvelope, Worker, make_idempotency_key
 from metismedia.orchestration import DossierResult, Orchestrator
 from metismedia.orchestration.registry import build_handler_registry
 
@@ -82,6 +84,7 @@ async def run_event_driven_flow(
     budget: Budget,
     ledger: CostLedger | None,
     timeout_s: float = 30.0,
+    max_poll_iterations: int = 800,
 ) -> DossierResult:
     """Run event-driven flow: start_run, Worker, await_completion."""
     redis = clean_redis
@@ -89,7 +92,7 @@ async def run_event_driven_flow(
     orchestrator = Orchestrator(
         bus=bus,
         poll_interval_seconds=0.05,
-        max_poll_iterations=200,
+        max_poll_iterations=max_poll_iterations,  # 600 -> ~30s at 0.05s poll
     )
     handler_registry = build_handler_registry(budget=budget, ledger=ledger, bus=bus)
     worker = Worker(redis, bus, consumer_name="e2e-worker")
@@ -329,3 +332,117 @@ async def test_orchestrator_e2e_deterministic_results(tenant_id, clean_redis):
     assert result1.status == result2.status
     assert result1.target_cards_count == result2.target_cards_count
     assert result1.drafts_count == result2.drafts_count
+
+
+@pytest.mark.asyncio
+async def test_duplicate_publish_same_idem_key_does_not_double_execute(
+    tenant_id, in_memory_ledger, clean_redis
+):
+    """Duplicate publish with same idempotency key is skipped; run stays correct."""
+    query_embedding_id = await seed_influencers(tenant_id, count=1)
+
+    brief = CampaignBrief(
+        tenant_id=tenant_id,
+        name="Idempotency Test",
+        description="Testing duplicate event skip",
+        polarity_intent=PolarityIntent.ALLIES,
+        commercial_mode=CommercialMode.EARNED,
+        finalized=True,
+        slot_values={"query_embedding_id": query_embedding_id},
+    )
+
+    budget = Budget(max_dollars=5.0)
+    result = await run_event_driven_flow(
+        tenant_id=tenant_id,
+        brief=brief,
+        clean_redis=clean_redis,
+        budget=budget,
+        ledger=in_memory_ledger,
+    )
+
+    assert result.status == "completed"
+    assert result.target_cards_count == 1
+    assert result.drafts_count == 1
+
+    async with db_session() as session:
+        tc_repo = TargetCardRepo(session)
+        target_cards = await tc_repo.list_target_cards(tenant_id, result.campaign_id)
+    assert len(target_cards) == 1
+    influencer_id = str(target_cards[0]["influencer_id"])
+
+    idem_key = make_idempotency_key(
+        tenant_id=tenant_id,
+        run_id=result.run_id,
+        node=NodeName.G,
+        event_name="node_g.input",
+        step=f"finalize:{influencer_id}",
+    )
+    duplicate_envelope = EventEnvelope(
+        tenant_id=tenant_id,
+        node=NodeName.G,
+        event_name="node_g.input",
+        trace_id=result.trace_id or "",
+        run_id=str(result.run_id),
+        idempotency_key=idem_key,
+        payload={"campaign_id": str(result.campaign_id), "influencer_id": influencer_id},
+    )
+    bus = EventBus(clean_redis)
+    await bus.publish(duplicate_envelope)
+
+    handler_registry = build_handler_registry(budget=budget, ledger=in_memory_ledger, bus=bus)
+    worker = Worker(clean_redis, bus, consumer_name="idem-dup-test")
+    await worker.run(handler_registry, stop_after=1, budget=budget, ledger=in_memory_ledger)
+
+    async with db_session() as session:
+        run_repo = RunRepo(session)
+        row = await run_repo.get_by_id(tenant_id, result.run_id)
+    assert row is not None
+    rj = row.get("result_json")
+    if isinstance(rj, str):
+        rj = json.loads(rj) if rj else {}
+    assert rj.get("target_cards_count") == 1, "Duplicate node_g should not double target cards"
+    assert rj.get("drafts_count") == 1, "Duplicate node_g should not double drafts"
+
+
+@pytest.mark.asyncio
+async def test_budget_exceeded_fails_run_no_drafts(tenant_id, in_memory_ledger, clean_redis):
+    """Budget(max_dollars=0.01) causes run to fail with Budget exceeded; no drafts created."""
+    query_embedding_id = await seed_influencers(tenant_id, count=2)
+
+    brief = CampaignBrief(
+        tenant_id=tenant_id,
+        name="Budget Cap Test",
+        description="Run should fail when budget exceeded",
+        polarity_intent=PolarityIntent.ALLIES,
+        commercial_mode=CommercialMode.EARNED,
+        finalized=True,
+        slot_values={"query_embedding_id": query_embedding_id},
+    )
+
+    budget = Budget(max_dollars=0.01)
+
+    result = await run_event_driven_flow(
+        tenant_id=tenant_id,
+        brief=brief,
+        clean_redis=clean_redis,
+        budget=budget,
+        ledger=in_memory_ledger,
+        timeout_s=45.0,
+        max_poll_iterations=900,
+    )
+
+    async with db_session() as session:
+        run_repo = RunRepo(session)
+        row = await run_repo.get_by_id(tenant_id, result.run_id)
+    assert row, "Run should exist"
+    status = row.get("status") or result.status
+    error_msg = row.get("error_message") or result.error_message or ""
+    assert status == "failed", f"Run should be failed; got status={status}"
+    assert "Budget exceeded" in error_msg, (
+        f"Run should fail with Budget exceeded; got error_message={error_msg!r}"
+    )
+
+    async with db_session() as session:
+        draft_repo = DraftRepo(session)
+        drafts = await draft_repo.list_drafts(tenant_id, result.campaign_id)
+    assert len(drafts) == 0, "Expected no drafts when run fails on budget"

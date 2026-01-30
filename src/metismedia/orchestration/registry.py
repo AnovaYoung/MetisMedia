@@ -31,7 +31,10 @@ def build_handler_registry(
             _ledger: CostLedger | None,
             _bus: EventBus,
         ) -> Callable[..., Awaitable[None]]:
-            async def wrapper(envelope: EventEnvelope) -> None:
+            async def wrapper(envelope: EventEnvelope, **kwargs: Any) -> None:
+                # Worker may pass budget_state (and legacy ledger); use registry's
+                # budget/ledger/bus to avoid duplicate keyword arguments.
+                extra = {k: v for k, v in kwargs.items() if k not in ("ledger", "budget", "bus")}
                 async with db_session() as session:
                     await _handler(
                         envelope,
@@ -39,6 +42,7 @@ def build_handler_registry(
                         budget=_budget,
                         ledger=_ledger,
                         bus=_bus,
+                        **extra,
                     )
                     await session.commit()
 

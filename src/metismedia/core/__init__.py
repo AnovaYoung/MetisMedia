@@ -4,6 +4,7 @@ from metismedia.core.budget import Budget, BudgetExceeded, BudgetState, budget_g
 from metismedia.core.ledger import (
     CostEntry,
     CostLedger,
+    InMemoryLedger,
     JsonLogLedger,
     compute_cost,
 )
@@ -16,5 +17,6 @@ __all__ = [
     "CostEntry",
     "CostLedger",
     "compute_cost",
+    "InMemoryLedger",
     "JsonLogLedger",
 ]
