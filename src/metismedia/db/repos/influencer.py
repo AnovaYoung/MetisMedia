@@ -29,6 +29,8 @@ class InfluencerRepo(BaseRepo):
         bio_embedding_id: UUID | None = None,
         recent_embedding_id: UUID | None = None,
         bio_text: str | None = None,
+        last_scraped_at: datetime | None = None,
+        last_pulse_checked_at: datetime | None = None,
     ) -> UUID:
         """Upsert an influencer (insert or update on conflict)."""
         influencer_id = self.generate_uuid()
@@ -40,12 +42,14 @@ class InfluencerRepo(BaseRepo):
                     id, tenant_id, canonical_name, primary_url, platform, geography,
                     follower_count, commercial_mode, polarity_score,
                     bio_embedding_id, recent_embedding_id, bio_text,
+                    last_scraped_at, last_pulse_checked_at,
                     created_at, updated_at
                 )
                 VALUES (
                     :id, :tenant_id, :canonical_name, :primary_url, :platform, :geography,
                     :follower_count, :commercial_mode, :polarity_score,
                     :bio_embedding_id, :recent_embedding_id, :bio_text,
+                    :last_scraped_at, :last_pulse_checked_at,
                     :created_at, :updated_at
                 )
                 ON CONFLICT (tenant_id, primary_url) WHERE primary_url IS NOT NULL
@@ -59,6 +63,8 @@ class InfluencerRepo(BaseRepo):
                     bio_embedding_id = COALESCE(EXCLUDED.bio_embedding_id, influencers.bio_embedding_id),
                     recent_embedding_id = COALESCE(EXCLUDED.recent_embedding_id, influencers.recent_embedding_id),
                     bio_text = COALESCE(EXCLUDED.bio_text, influencers.bio_text),
+                    last_scraped_at = COALESCE(EXCLUDED.last_scraped_at, influencers.last_scraped_at),
+                    last_pulse_checked_at = COALESCE(EXCLUDED.last_pulse_checked_at, influencers.last_pulse_checked_at),
                     updated_at = EXCLUDED.updated_at
                 RETURNING id
             """),
@@ -75,6 +81,8 @@ class InfluencerRepo(BaseRepo):
                 "bio_embedding_id": bio_embedding_id,
                 "recent_embedding_id": recent_embedding_id,
                 "bio_text": bio_text,
+                "last_scraped_at": last_scraped_at,
+                "last_pulse_checked_at": last_pulse_checked_at,
                 "created_at": now,
                 "updated_at": now,
             },

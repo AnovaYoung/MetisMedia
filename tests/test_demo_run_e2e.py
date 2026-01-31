@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
 import pytest
@@ -21,6 +22,7 @@ from metismedia.db.session import db_session
 from metismedia.events import EventBus, EventEnvelope, Worker, make_idempotency_key
 from metismedia.orchestration import DossierResult, Orchestrator
 from metismedia.orchestration.registry import build_handler_registry
+from metismedia.providers import EmbeddingProvider
 
 
 @pytest.fixture
@@ -49,6 +51,8 @@ async def seed_influencers(tenant_id, count: int = 20) -> str:
             vector=query_vector,
         )
 
+        now = datetime.now(timezone.utc)
+
         for i in range(count):
             similarity_offset = 0.05 * (i % 10)
             vec = [1.0 - similarity_offset, similarity_offset] + [0.0] * 1534
@@ -70,11 +74,27 @@ async def seed_influencers(tenant_id, count: int = 20) -> str:
                 follower_count=1000 * (i + 1),
                 bio_embedding_id=bio_emb_id,
                 bio_text=f"Test bio for influencer {i + 1}",
+                polarity_score=5,  # Positive polarity for allies campaign
+                last_scraped_at=now,  # Recent scrape for good recency score
             )
 
         await session.commit()
 
         return str(query_emb_id)
+
+
+class FixedVectorEmbeddingProvider(EmbeddingProvider):
+    """Returns a fixed vector for every embed() so Node B pulse similarity equals 1.0."""
+
+    def __init__(self, vector: list[float]) -> None:
+        self._vector = list(vector)
+
+    async def embed(
+        self,
+        texts: list[str],
+        model: str | None = None,
+    ) -> list[list[float]]:
+        return [self._vector for _ in texts]
 
 
 async def run_event_driven_flow(
@@ -85,6 +105,7 @@ async def run_event_driven_flow(
     ledger: CostLedger | None,
     timeout_s: float = 30.0,
     max_poll_iterations: int = 800,
+    embedding_provider: EmbeddingProvider | None = None,
 ) -> DossierResult:
     """Run event-driven flow: start_run, Worker, await_completion."""
     redis = clean_redis
@@ -94,7 +115,9 @@ async def run_event_driven_flow(
         poll_interval_seconds=0.05,
         max_poll_iterations=max_poll_iterations,  # 600 -> ~30s at 0.05s poll
     )
-    handler_registry = build_handler_registry(budget=budget, ledger=ledger, bus=bus)
+    handler_registry = build_handler_registry(
+        budget=budget, ledger=ledger, bus=bus, embedding_provider=embedding_provider
+    )
     worker = Worker(redis, bus, consumer_name="e2e-worker")
 
     run_id = await orchestrator.start_run(tenant_id=tenant_id, brief=brief)
@@ -115,6 +138,8 @@ async def test_orchestrator_e2e_creates_target_cards_and_drafts(
 ):
     """E2E test: event-driven orchestrator creates target cards and drafts."""
     query_embedding_id = await seed_influencers(tenant_id, count=20)
+    query_vector = [1.0] + [0.0] * 1535
+    embedding_provider = FixedVectorEmbeddingProvider(query_vector)
 
     brief = CampaignBrief(
         tenant_id=tenant_id,
@@ -137,6 +162,7 @@ async def test_orchestrator_e2e_creates_target_cards_and_drafts(
         clean_redis=clean_redis,
         budget=budget,
         ledger=in_memory_ledger,
+        embedding_provider=embedding_provider,
     )
 
     assert result.status == "completed", f"Run failed: {result.error_message}"
@@ -173,6 +199,8 @@ async def test_orchestrator_e2e_records_costs(
 ):
     """E2E test: event-driven flow records cost entries."""
     query_embedding_id = await seed_influencers(tenant_id, count=5)
+    query_vector = [1.0] + [0.0] * 1535
+    embedding_provider = FixedVectorEmbeddingProvider(query_vector)
 
     brief = CampaignBrief(
         tenant_id=tenant_id,
@@ -192,6 +220,7 @@ async def test_orchestrator_e2e_records_costs(
         clean_redis=clean_redis,
         budget=budget,
         ledger=in_memory_ledger,
+        embedding_provider=embedding_provider,
     )
 
     assert result.status == "completed"
@@ -340,6 +369,8 @@ async def test_duplicate_publish_same_idem_key_does_not_double_execute(
 ):
     """Duplicate publish with same idempotency key is skipped; run stays correct."""
     query_embedding_id = await seed_influencers(tenant_id, count=1)
+    query_vector = [1.0] + [0.0] * 1535
+    embedding_provider = FixedVectorEmbeddingProvider(query_vector)
 
     brief = CampaignBrief(
         tenant_id=tenant_id,
@@ -358,6 +389,7 @@ async def test_duplicate_publish_same_idem_key_does_not_double_execute(
         clean_redis=clean_redis,
         budget=budget,
         ledger=in_memory_ledger,
+        embedding_provider=embedding_provider,
     )
 
     assert result.status == "completed"

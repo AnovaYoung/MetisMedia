@@ -10,7 +10,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from metismedia.contracts.enums import NodeName
 from metismedia.core.budget import Budget, BudgetState, budget_guard
 from metismedia.core.ledger import CostEntry, CostLedger, compute_cost
-from metismedia.db.queries.node_b import reserve_top_influencers_for_review
 from metismedia.db.repos import (
     ContactRepo,
     DraftRepo,
@@ -139,69 +138,6 @@ async def handle_node_a_brief_finalized(
     await bus.publish(next_envelope)
 
 
-async def handle_node_b_input(
-    envelope: EventEnvelope,
-    session: AsyncSession,
-    budget: Budget,
-    ledger: CostLedger | None,
-    bus: EventBus,
-    budget_state: BudgetState | None = None,
-) -> None:
-    """Node B: reserve top influencers, record cost, publish node_b.directive_emitted per reserved."""
-    tenant_id = envelope.tenant_id
-    campaign_id = envelope.payload.get("campaign_id")
-    query_embedding_id = envelope.payload.get("query_embedding_id")
-    limit = envelope.payload.get("limit", 10)
-
-    if not query_embedding_id:
-        logger.warning("Node B: No query_embedding_id")
-        return
-
-    reserved = await reserve_top_influencers_for_review(
-        session=session,
-        tenant_id=tenant_id,
-        query_embedding_id=UUID(query_embedding_id),
-        limit=limit,
-        reason=f"campaign:{campaign_id}",
-    )
-
-    _record_cost(
-        envelope, ledger, NodeName.B, "postgres", "vector_search", 0.001, float(len(reserved)),
-        budget=budget, budget_state=budget_state,
-    )
-
-    if not reserved:
-        logger.warning("Node B: No influencers reserved, marking run completed with 0 targets")
-        await _mark_run_completed_no_targets(
-            session, tenant_id, envelope.run_id, str(campaign_id)
-        )
-        return
-
-    for r in reserved:
-        next_envelope = EventEnvelope(
-            tenant_id=tenant_id,
-            node=NodeName.B,
-            event_name="node_b.directive_emitted",
-            trace_id=envelope.trace_id,
-            run_id=envelope.run_id,
-            idempotency_key=make_idempotency_key(
-                tenant_id=tenant_id,
-                run_id=envelope.run_id,
-                node=NodeName.B,
-                event_name="node_b.directive_emitted",
-                step=f"reserve:{r.influencer_id}",
-            ),
-            payload={
-                "campaign_id": str(campaign_id),
-                "influencer_id": str(r.influencer_id),
-                "reservation_id": str(r.reservation_id),
-                "similarity": r.similarity,
-                "action": "proceed",
-            },
-        )
-        await bus.publish(next_envelope)
-
-    logger.info(f"Node B: Reserved {len(reserved)} influencers for campaign {campaign_id}")
 
 
 async def handle_node_b_directive_emitted(
@@ -503,9 +439,9 @@ async def handle_node_g_input(
     )
 
 
+# node_b.input is routed to metismedia.nodes.node_b.handler in registry.build_handler_registry
 HANDLER_MAP: dict[str, Any] = {
     "node_a.brief_finalized": handle_node_a_brief_finalized,
-    "node_b.input": handle_node_b_input,
     "node_b.directive_emitted": handle_node_b_directive_emitted,
     "node_c.input": handle_node_c_input,
     "node_d.input": handle_node_d_input,
